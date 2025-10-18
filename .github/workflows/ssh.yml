@@ -12,16 +12,27 @@ jobs:
       - name: Update & Install Essentials
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl ufw openssh-server
+          sudo apt-get install -y curl ufw openssh-server openssh-client
 
-      - name: Enable Root SSH Login
+      - name: Enable Root SSH Login & Set Given Password
         run: |
-          sudo passwd -d root
-          echo "root:$(openssl rand -base64 12)" | sudo chpasswd
-          echo "ROOT_PASS=$(sudo cat /etc/shadow | grep root | cut -d: -f2)" >> $GITHUB_ENV
+          # ضع كلمة المرور التي طلبتها لروت
+          ROOT_PASS='3962591'
+
+          # تعيين كلمة المرور لروت
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          # تأكد من تمكين PermitRootLogin و PasswordAuthentication في sshd_config
           sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
           sudo sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+
+          # أعد تشغيل خدمة SSH للتغييرات
           sudo systemctl restart sshd
+
+          # احفظ كلمة المرور في متغير بيئة للوصول إليه في خطوات لاحقة من الـ workflow
+          echo "ROOT_PLAIN_PASS=${ROOT_PASS}" >> $GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -35,30 +46,44 @@ jobs:
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey=$TS_AUTHKEY --hostname=gh-ubuntu-${{ github.run_id }} --accept-routes --ssh
-          sleep 5
-          TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          # شغّل tailscale مع auth key من Secrets
+          sudo tailscale up --authkey=$TS_AUTHKEY --hostname=gh-ubuntu-${{ github.run_id }} --accept-routes --accept-dns --ssh || true
+          # انتظر قليلاً ليحصل على IP
+          retries=0
+          TS_IP=""
+          while [ -z "$TS_IP" ] && [ $retries -lt 12 ]; do
+            TS_IP=$(sudo tailscale ip -4 | tr -d '\r\n')
+            sleep 5
+            retries=$((retries+1))
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale IP not assigned."
+            exit 1
+          fi
+          echo "TAILSCALE_IP=${TS_IP}" >> $GITHUB_ENV
 
       - name: Allow SSH in Firewall
         run: |
           sudo ufw allow 22/tcp
           sudo ufw --force enable
 
-      - name: Show Connection Info
+      - name: Show Connection Info (plain root password)
         run: |
           echo "======================="
           echo " SSH ACCESS INFO "
           echo "======================="
           echo "Tailscale IP: $TAILSCALE_IP"
           echo "Username: root"
-          echo "Password: <see below>"
-          echo "======================="
-          sudo grep root /etc/shadow | cut -d: -f2 | base64
+          echo "Password: $ROOT_PLAIN_PASS"
           echo ""
           echo "To connect: ssh root@${TAILSCALE_IP}"
-          echo ""
-          echo "Keep session active below ⬇️"
+          echo "If SSH prompts for password, use the password above."
+          echo "======================="
+
+      - name: Verify SSH Connectivity (optional test)
+        run: |
+          # تحقق من أن منفذ 22 على Tailscale IP مفتوح من الـ runner نفسه
+          timeout 10 bash -c "echo > /dev/tcp/${TAILSCALE_IP}/22" && echo "TCP port 22 seems open" || echo "Cannot reach port 22 yet"
 
       - name: Keep SSH Session Active
         run: |
